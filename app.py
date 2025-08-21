@@ -9,6 +9,7 @@ import zipfile
 import matplotlib.pyplot as plt
 from graphviz import Digraph
 import random  # Added for MTBF/MTTR distributions
+import numpy as np  # Used for plotting distribution curves
 
 # ========== Configuration ==========
 SAVE_DIR = "simulations"
@@ -96,6 +97,8 @@ def new_simulation():
     valid_groups = {}
     group_names = []
     upload_mode = False  # Flag to track if upload mode is active
+    # Dictionary to hold reliability metrics per group (mtbf, mttr) when using uploaded sheet
+    group_metrics = {}
 
     if method == "Upload Sheet":
         uploaded_file = st.file_uploader("Upload Excel File (.xlsx)", type=["xlsx"])
@@ -128,6 +131,28 @@ def new_simulation():
                         f"{station}_EQ{i+1}": cycle_times[i] for i in range(num_eq)
                     }
                     group_names.append(station)
+
+                    # Gather reliability information if columns exist
+                    # Lowercase column names ensure matching
+                    if {'issue count', 'downtime', 'duration'}.issubset(df.columns):
+                        try:
+                            issue_count = float(row['issue count']) if pd.notna(row['issue count']) else None
+                        except Exception:
+                            issue_count = None
+                        try:
+                            downtime_val = float(row['downtime']) if pd.notna(row['downtime']) else None
+                        except Exception:
+                            downtime_val = None
+                        try:
+                            duration_val = float(row['duration']) if pd.notna(row['duration']) else None
+                        except Exception:
+                            duration_val = None
+                        if issue_count and issue_count > 0 and downtime_val is not None and duration_val is not None:
+                            mtbf_g = max((duration_val - downtime_val) / issue_count, 0.0)
+                            mttr_g = max(downtime_val / issue_count, 0.0)
+                            group_metrics[station] = (mtbf_g, mttr_g)
+                        else:
+                            group_metrics[station] = None
 
                 # Automatically set connections in sequence:
                 connections = {}
@@ -209,17 +234,55 @@ def new_simulation():
         for i, zone in enumerate(lockout_zones):
             st.markdown(f"**L{i+1}**: {', '.join(zone)}")
 
-    # Option to add downtime information for lockout zones
-    add_downtime = st.checkbox("Add Downtime for Lockout Zones?")
-    downtime_info = {}
-    if add_downtime:
-        st.subheader("Provide Downtime Details")
-        for i, zone in enumerate(lockout_zones):
-            zone_name = f"L{i+1}"
-            st.markdown(f"##### {zone_name} ({', '.join(zone)})")
-            issues = st.number_input(f"Number of Issues for {zone_name}", min_value=0, step=1, key=f"issues_{zone_name}")
-            downtime = st.number_input(f"Total Downtime for {zone_name} (seconds)", min_value=0.0, step=1.0, key=f"downtime_{zone_name}")
-            downtime_info[zone_name] = {"issues": int(issues), "downtime": float(downtime)}
+    # Ask whether to consider downtime and compute zone-level parameters accordingly
+    consider_choice = st.radio("Consider downtime?", ["No", "Yes"], key="consider_downtime_choice")
+    consider_downtime = (consider_choice == "Yes")
+    zone_params = {}
+    if consider_downtime:
+        if method == "Upload Sheet":
+            # Compute zone-level MTBF and MTTR from uploaded sheet reliability
+            for i, zone in enumerate(lockout_zones):
+                zone_name = f"L{i+1}"
+                total_lambda = 0.0
+                avail_product = 1.0
+                has_rel = False
+                for g in zone:
+                    rel = group_metrics.get(g)
+                    eq_count = len(valid_groups.get(g, {}))
+                    if rel and rel[0] is not None:
+                        mtbf_g, mttr_g = rel
+                        if mtbf_g > 0:
+                            for _ in range(eq_count):
+                                total_lambda += 1.0 / mtbf_g
+                                avail = mtbf_g / (mtbf_g + mttr_g) if (mtbf_g + mttr_g) > 0 else 1.0
+                                avail_product *= avail
+                        has_rel = True
+                if has_rel and total_lambda > 0:
+                    zone_mtbf = 1.0 / total_lambda
+                    zone_avail = avail_product
+                    zone_mttr = zone_mtbf * (1.0 / zone_avail - 1.0) if zone_avail > 0 else None
+                    zone_params[zone_name] = {"mtbf": zone_mtbf, "mttr": zone_mttr}
+                else:
+                    zone_params[zone_name] = None
+        else:
+            # Manual entry of downtime: ask per lockout zone
+            st.subheader("Provide Downtime Details")
+            for i, zone in enumerate(lockout_zones):
+                zone_name = f"L{i+1}"
+                st.markdown(f"##### {zone_name} ({', '.join(zone)})")
+                issues_val = st.number_input(f"Number of Issues for {zone_name}", min_value=0, step=1, key=f"issues_{zone_name}")
+                downtime_val = st.number_input(f"Total Downtime for {zone_name} (seconds)", min_value=0.0, step=1.0, key=f"downtime_{zone_name}")
+                duration_val = st.number_input(f"Duration of Data for {zone_name} (seconds)", min_value=1.0, step=1.0, key=f"duration_{zone_name}")
+                if issues_val and issues_val > 0:
+                    mtbf_zone = max((duration_val - downtime_val) / issues_val, 0.0)
+                    mttr_zone = max(downtime_val / issues_val, 0.0)
+                    zone_params[zone_name] = {"mtbf": mtbf_zone, "mttr": mttr_zone}
+                else:
+                    zone_params[zone_name] = None
+    else:
+        # No downtime considered: all zones have no failures
+        for i in range(len(lockout_zones)):
+            zone_params[f"L{i+1}"] = None
 
     # Step 3: Simulation Duration & Save (shown always)
     st.header("Step 3: Simulation Duration & Save")
@@ -231,6 +294,7 @@ def new_simulation():
     st.header("Save your simulation setup")
     save_as = st.text_input("Filename to save current inputs", value=sim_name, key="save_filename")
     if st.button("💾 Save Current Setup"):
+        # Persist simulation configuration along with computed zone parameters and downtime choice
         data_to_save = {
             "station_groups": [{"group_name": g, "equipment": valid_groups[g]} for g in valid_groups],
             "connections": [(src, dst) for src, tos in st.session_state.connections.items() for dst in tos],
@@ -239,8 +303,8 @@ def new_simulation():
             "simulation_name": save_as,
             "valid_groups": valid_groups,
             "lockout_zones": lockout_zones,
-            "downtime_info": downtime_info if add_downtime else None,
-            "add_downtime": add_downtime,
+            "zone_params": zone_params,
+            "consider_downtime": consider_downtime,
         }
         with open(os.path.join(SAVE_DIR, f"{save_as}.json"), "w") as f:
             json.dump(data_to_save, f, indent=2)
@@ -254,7 +318,7 @@ def new_simulation():
             st.session_state.from_stations,
             duration,
             lockout_zones=lockout_zones,
-            downtime_info=downtime_info if add_downtime else None
+            zone_params=zone_params
         )
         show_detailed_summary(run_result, valid_groups, st.session_state.from_stations, duration)
 
@@ -351,7 +415,16 @@ def edit_simulation():
             st.session_state.simulation_data = sim_data
 
             lockout_zones = sim_data.get("lockout_zones")
-            downtime_info = sim_data.get("downtime_info")
+            zone_params = sim_data.get("zone_params")
+            # Convert zone_params into expected format (zone_name -> (mtbf, mttr)) if stored as dict
+            converted_zone_params = None
+            if zone_params:
+                converted_zone_params = {}
+                for k, v in zone_params.items():
+                    if v and isinstance(v, dict):
+                        converted_zone_params[k] = (v.get("mtbf"), v.get("mttr"))
+                    else:
+                        converted_zone_params[k] = None
 
             run_result = run_simulation_backend(
                 sim_data["station_groups"],
@@ -359,7 +432,7 @@ def edit_simulation():
                 sim_data["from_stations"],
                 duration_val,
                 lockout_zones=lockout_zones,
-                downtime_info=downtime_info
+                zone_params=converted_zone_params
             )
             valid_groups = {g["group_name"]: g["equipment"] for g in sim_data["station_groups"]}
             show_detailed_summary(run_result, valid_groups, sim_data["from_stations"], duration_val)
@@ -384,10 +457,13 @@ def edit_simulation():
 # ========== Simulation Backend ==========
 
 def run_simulation_backend(station_groups_data, connections_list, from_stations_dict, duration,
-                           lockout_zones=None, downtime_info=None):
+                           lockout_zones=None, zone_params=None, downtime_info=None):
     """
     Prepare and execute the simulation. Optional parameters allow specifying lockout zones and
-    downtime information to inject MTBF/MTTR behavior.
+    either precomputed zone-level MTBF/MTTR values (zone_params) or legacy downtime information.
+    If zone_params is provided it will be used directly. If not, downtime_info will be used
+    for backward compatibility to compute zone parameters. If neither is provided, zones will
+    operate without downtime.
     """
     env = simpy.Environment()
     station_groups = {g["group_name"]: g["equipment"] for g in station_groups_data}
@@ -411,29 +487,43 @@ def run_simulation_backend(station_groups_data, connections_list, from_stations_
             group_to_zone[g] = "L1"
         lockout_zones = [list(station_groups.keys())]
 
-    # Compute MTBF and MTTR for each zone based on downtime information
-    zone_params = {}
-    if downtime_info:
+    # Prepare zone parameters: use provided zone_params if available, else compute from downtime_info
+    computed_zone_params = {}
+    if zone_params is not None:
+        # Convert any dict or tuple values into a uniform tuple or None
         for i, zone in enumerate(lockout_zones):
             zone_name = f"L{i+1}"
-            info = downtime_info.get(zone_name)
+            param = zone_params.get(zone_name) if isinstance(zone_params, dict) else None
+            if param is None:
+                computed_zone_params[zone_name] = None
+            elif isinstance(param, tuple) and len(param) == 2:
+                computed_zone_params[zone_name] = param
+            elif isinstance(param, dict):
+                computed_zone_params[zone_name] = (param.get("mtbf"), param.get("mttr"))
+            else:
+                computed_zone_params[zone_name] = None
+    elif downtime_info:
+        # Legacy behaviour: compute zone parameters from downtime info
+        for i, zone in enumerate(lockout_zones):
+            zone_name = f"L{i+1}"
+            info = downtime_info.get(zone_name) if isinstance(downtime_info, dict) else None
             if info and info.get("issues", 0) > 0:
                 total_downtime = info.get("downtime", 0.0)
                 num_issues = info.get("issues", 0)
-                # Total uptime is simulation duration minus downtime
                 total_uptime = max(duration - total_downtime, 0.0001)
                 mtbf = total_uptime / num_issues
                 mttr = total_downtime / num_issues
-                zone_params[zone_name] = (mtbf, mttr)
+                computed_zone_params[zone_name] = (mtbf, mttr)
             else:
-                zone_params[zone_name] = None
+                computed_zone_params[zone_name] = None
     else:
+        # No downtime consideration: all zones have no failures
         for i, zone in enumerate(lockout_zones):
             zone_name = f"L{i+1}"
-            zone_params[zone_name] = None
+            computed_zone_params[zone_name] = None
 
     sim = FactorySimulation(env, station_groups, duration, dict(connections), from_stations_dict,
-                            group_to_zone=group_to_zone, zone_params=zone_params)
+                            group_to_zone=group_to_zone, zone_params=computed_zone_params)
     env.process(sim.run())
     env.run(until=duration)
     return sim
@@ -694,6 +784,40 @@ def show_detailed_summary(sim, valid_groups, from_stations, duration):
     fig.savefig(buf, format='png')
     buf.seek(0)
     st.download_button("📥 Download Chart (PNG)", data=buf, file_name="throughput_wip.png", mime="image/png")
+
+    # === MTBF & MTTR Distribution Charts ===
+    st.subheader("📉 MTBF & MTTR Distributions by Zone")
+    # Plot probability density functions for each zone if parameters are available
+    try:
+        zone_params = getattr(sim, 'zone_params', {})
+    except Exception:
+        zone_params = {}
+    if zone_params:
+        for zone_name, params in zone_params.items():
+            if params and isinstance(params, tuple) and params[0] is not None and params[1] is not None:
+                mtbf, mttr = params
+                # Limit to positive values
+                if mtbf and mttr and mtbf > 0 and mttr > 0:
+                    # Generate x-values for MTBF (exponential) and MTTR (Erlang k=2)
+                    x_mtbf = np.linspace(0, 5 * mtbf, 100)
+                    y_mtbf = (1.0 / mtbf) * np.exp(-x_mtbf / mtbf)
+                    x_mttr = np.linspace(0, 5 * mttr, 100)
+                    scale = mttr / 2.0
+                    # Erlang(k=2) PDF: f(x) = (x/(scale^2)) * exp(-x/scale)
+                    y_mttr = (x_mttr / (scale ** 2)) * np.exp(-x_mttr / scale)
+                    fig_dist, ax_dist = plt.subplots(figsize=(6, 3))
+                    ax_dist.plot(x_mtbf, y_mtbf, label=f"{zone_name} MTBF (Exp)")
+                    ax_dist.plot(x_mttr, y_mttr, label=f"{zone_name} MTTR (Erlang)")
+                    ax_dist.set_title(f"Zone {zone_name} MTBF & MTTR Distributions")
+                    ax_dist.set_xlabel("Time (s)")
+                    ax_dist.set_ylabel("Density")
+                    ax_dist.legend()
+                    ax_dist.grid(True, linestyle='--', alpha=0.6)
+                    st.pyplot(fig_dist)
+            else:
+                st.markdown(f"**{zone_name}:** No downtime considered or insufficient data to compute distributions.")
+    else:
+        st.info("No zone-level MTBF/MTTR information available.")
 
     # === ZIP Download of All Charts and Tables ===
     st.markdown("### 📦 Export All Results")
