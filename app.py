@@ -238,47 +238,55 @@ def new_simulation():
     consider_choice = st.radio("Consider downtime?", ["No", "Yes"], key="consider_downtime_choice")
     consider_downtime = (consider_choice == "Yes")
     zone_params = {}
+
+    # If downtime is considered, gather reliability information and compute zone-level parameters
     if consider_downtime:
+        # Build a local metrics dictionary for groups
+        local_group_metrics = {}
         if method == "Upload Sheet":
-            # Compute zone-level MTBF and MTTR from uploaded sheet reliability
-            for i, zone in enumerate(lockout_zones):
-                zone_name = f"L{i+1}"
-                total_lambda = 0.0
-                avail_product = 1.0
-                has_rel = False
-                for g in zone:
-                    rel = group_metrics.get(g)
-                    eq_count = len(valid_groups.get(g, {}))
-                    if rel and rel[0] is not None:
-                        mtbf_g, mttr_g = rel
-                        if mtbf_g > 0:
-                            for _ in range(eq_count):
-                                total_lambda += 1.0 / mtbf_g
-                                avail = mtbf_g / (mtbf_g + mttr_g) if (mtbf_g + mttr_g) > 0 else 1.0
-                                avail_product *= avail
-                        has_rel = True
-                if has_rel and total_lambda > 0:
-                    zone_mtbf = 1.0 / total_lambda
-                    zone_avail = avail_product
-                    zone_mttr = zone_mtbf * (1.0 / zone_avail - 1.0) if zone_avail > 0 else None
-                    zone_params[zone_name] = {"mtbf": zone_mtbf, "mttr": zone_mttr}
-                else:
-                    zone_params[zone_name] = None
+            # Use reliability parsed from the uploaded sheet
+            local_group_metrics = group_metrics.copy()
         else:
-            # Manual entry of downtime: ask per lockout zone
-            st.subheader("Provide Downtime Details")
-            for i, zone in enumerate(lockout_zones):
-                zone_name = f"L{i+1}"
-                st.markdown(f"##### {zone_name} ({', '.join(zone)})")
-                issues_val = st.number_input(f"Number of Issues for {zone_name}", min_value=0, step=1, key=f"issues_{zone_name}")
-                downtime_val = st.number_input(f"Total Downtime for {zone_name} (seconds)", min_value=0.0, step=1.0, key=f"downtime_{zone_name}")
-                duration_val = st.number_input(f"Duration of Data for {zone_name} (seconds)", min_value=1.0, step=1.0, key=f"duration_{zone_name}")
+            # Manual entry: ask for issue count, downtime and duration per station group
+            st.subheader("Provide Downtime Details per Station Group")
+            for g in filtered_group_names:
+                st.markdown(f"##### {g}")
+                issues_val = st.number_input(
+                    f"Number of Issues for {g}", min_value=0, step=1, key=f"issues_{g}")
+                downtime_val = st.number_input(
+                    f"Total Downtime for {g} (seconds)", min_value=0.0, step=1.0, key=f"downtime_{g}")
+                duration_val = st.number_input(
+                    f"Duration of Data for {g} (seconds)", min_value=1.0, step=1.0, key=f"duration_{g}")
                 if issues_val and issues_val > 0:
-                    mtbf_zone = max((duration_val - downtime_val) / issues_val, 0.0)
-                    mttr_zone = max(downtime_val / issues_val, 0.0)
-                    zone_params[zone_name] = {"mtbf": mtbf_zone, "mttr": mttr_zone}
+                    mtbf_g = max((duration_val - downtime_val) / issues_val, 0.0)
+                    mttr_g = max(downtime_val / issues_val, 0.0)
+                    local_group_metrics[g] = (mtbf_g, mttr_g)
                 else:
-                    zone_params[zone_name] = None
+                    local_group_metrics[g] = None
+        # Compute zone-level parameters from local_group_metrics
+        for i, zone in enumerate(lockout_zones):
+            zone_name = f"L{i+1}"
+            total_lambda = 0.0
+            avail_product = 1.0
+            has_rel = False
+            for g in zone:
+                rel = local_group_metrics.get(g)
+                eq_count = len(valid_groups.get(g, {}))
+                if rel and rel[0] is not None:
+                    mtbf_g, mttr_g = rel
+                    if mtbf_g > 0:
+                        for _ in range(eq_count):
+                            total_lambda += 1.0 / mtbf_g
+                            avail = mtbf_g / (mtbf_g + mttr_g) if (mtbf_g + mttr_g) > 0 else 1.0
+                            avail_product *= avail
+                    has_rel = True
+            if has_rel and total_lambda > 0:
+                zone_mtbf = 1.0 / total_lambda
+                zone_avail = avail_product
+                zone_mttr = zone_mtbf * (1.0 / zone_avail - 1.0) if zone_avail > 0 else None
+                zone_params[zone_name] = {"mtbf": zone_mtbf, "mttr": zone_mttr}
+            else:
+                zone_params[zone_name] = None
     else:
         # No downtime considered: all zones have no failures
         for i in range(len(lockout_zones)):
