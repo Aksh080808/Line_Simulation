@@ -99,6 +99,8 @@ def new_simulation():
     upload_mode = False  # Flag to track if upload mode is active
     # Dictionary to hold reliability metrics per group (mtbf, mttr) when using uploaded sheet
     group_metrics = {}
+    # Track whether the uploaded sheet includes reliability columns (issue count, downtime, duration)
+    sheet_has_reliability = False
 
     if method == "Upload Sheet":
         uploaded_file = st.file_uploader("Upload Excel File (.xlsx)", type=["xlsx"])
@@ -117,6 +119,9 @@ def new_simulation():
                 st.session_state.connections = {}
                 st.session_state.from_stations = {}
 
+                # Determine if reliability columns exist in the uploaded sheet
+                sheet_has_reliability = {'issue count', 'downtime', 'duration'}.issubset(df.columns)
+
                 # Parse stations from the sheet
                 for _, row in df.iterrows():
                     station = str(row['stations']).strip().upper()
@@ -134,7 +139,7 @@ def new_simulation():
 
                     # Gather reliability information if columns exist
                     # Lowercase column names ensure matching
-                    if {'issue count', 'downtime', 'duration'}.issubset(df.columns):
+                    if sheet_has_reliability:
                         try:
                             issue_count = float(row['issue count']) if pd.notna(row['issue count']) else None
                         except Exception:
@@ -245,6 +250,9 @@ def new_simulation():
         local_group_metrics = {}
         if method == "Upload Sheet":
             # Use reliability parsed from the uploaded sheet
+            # If the sheet lacks reliability columns, display an error
+            if not sheet_has_reliability:
+                st.error("The uploaded sheet does not contain the required columns (Issue Count, Downtime, Duration) for downtime calculations.")
             local_group_metrics = group_metrics.copy()
         else:
             # Manual entry: ask for issue count, downtime and duration per station group
